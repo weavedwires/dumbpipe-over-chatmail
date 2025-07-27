@@ -9,7 +9,6 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use dumbpipe::NodeTicket;
 #[cfg(unix)]
@@ -21,7 +20,7 @@ use iroh::{
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
     time::timeout,
 };
@@ -353,33 +352,42 @@ pub struct ConnectUnixArgs {
     pub common: CommonArgs,
 }
 
-/// Copy from a reader to a noq stream.
-/// Forward UDP packets between a QUIC connection (unreliable datagrams) and a
-/// local UDP socket.
+/// Forward UDP packets over a reliable QUIC bidirectional stream.
 ///
-/// Spawns two tasks:
-///   - QUIC → UDP
-///   - UDP → QUIC
-///
-/// Both directions are cancelled when either task finishes or on ctrl-c.
-async fn forward_udp_bidi(
-    conn: iroh::endpoint::Connection,
+/// Each packet is encoded as a four-byte big-endian length followed by its
+/// payload. QUIC datagrams cannot be used here: their maximum size depends on
+/// the path, and sending can fail when the datagram buffer is full.
+async fn forward_udp_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
     udp: tokio::net::UdpSocket,
 ) -> Result<()> {
     let token = CancellationToken::new();
     let udp = std::sync::Arc::new(udp);
+    // The remote peer for an unconnected UDP socket.
+    // This is the address of the local application that sends us packets.
+    // It is None until the first packet is received.
+    let remote_udp_peer = std::sync::Arc::new(tokio::sync::Mutex::new(None::<SocketAddr>));
+    let is_connected_udp = udp.peer_addr().is_ok();
 
-    // QUIC -> UDP
+    // Stream -> UDP
     let t1 = tokio::spawn({
-        let conn = conn.clone();
         let udp = udp.clone();
         let token = token.clone();
+        let remote_udp_peer = remote_udp_peer.clone();
         async move {
             loop {
                 tokio::select! {
-                    res = conn.read_datagram() => {
-                        let pkt = res.context("read_datagram")?;
-                        udp.send(&pkt).await.context("send udp")?;
+                    len = recv.read_u32() => {
+                        let len = len.context("read UDP frame length")?;
+                        ensure!(len <= 65_535, "UDP frame is too large: {len} bytes");
+                        let mut pkt = vec![0; len as usize];
+                        recv.read_exact(&mut pkt).await.context("read UDP frame")?;
+                        if is_connected_udp {
+                            udp.send(&pkt).await.context("send UDP packet")?;
+                        } else if let Some(peer) = *remote_udp_peer.lock().await {
+                            udp.send_to(&pkt, peer).await.context("send UDP packet")?;
+                        }
                     }
                     _ = token.cancelled() => break,
                 }
@@ -388,7 +396,7 @@ async fn forward_udp_bidi(
         }
     });
 
-    // UDP -> QUIC
+    // UDP -> stream
     let t2 = tokio::spawn({
         let udp = udp.clone();
         let token = token.clone();
@@ -397,9 +405,24 @@ async fn forward_udp_bidi(
             loop {
                 tokio::select! {
                     res = udp.recv_from(&mut buf) => {
-                        let (len, _src) = res.context("recv udp")?;
-                        conn.send_datagram(Bytes::copy_from_slice(&buf[..len]))
-                            .context("send_datagram")?;
+                        let (len, src) = res.context("recv udp")?;
+                        if !is_connected_udp {
+                            // This is the `connect-udp` case. We are acting as a server
+                            // for a local application. Keep the latest source address:
+                            // clients such as Hysteria may recreate their UDP socket
+                            // and therefore change the source port between sessions.
+                            let mut peer = remote_udp_peer.lock().await;
+                            if *peer != Some(src) {
+                                tracing::info!("established udp session with {}", src);
+                            }
+                            *peer = Some(src);
+                        }
+                        send.write_u32(len as u32)
+                            .await
+                            .context("write UDP frame length")?;
+                        send.write_all(&buf[..len])
+                            .await
+                            .context("write UDP frame")?;
                     }
                     _ = token.cancelled() => break,
                 }
@@ -413,8 +436,8 @@ async fn forward_udp_bidi(
         _ = tokio::signal::ctrl_c() => {
             token.cancel();
         }
-        res = t1 => res.context("quic->udp task")??,
-        res = t2 => res.context("udp->quic task")??,
+        res = t1 => res.context("stream->udp task")??,
+        res = t2 => res.context("udp->stream task")??,
     }
     Ok(())
 }
@@ -1183,7 +1206,7 @@ async fn main() -> Result<()> {
     match res {
         Ok(()) => std::process::exit(0),
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {e:#}");
             std::process::exit(1)
         }
     }
@@ -1196,16 +1219,7 @@ async fn listen_udp(args: ListenUdpArgs) -> Result<()> {
         Err(e) => bail!("invalid host string {}: {}", args.host, e),
     };
     let secret_key = get_or_create_secret()?;
-    let mut builder = Endpoint::builder()
-        .alpns(vec![args.common.alpn()?])
-        .secret_key(secret_key);
-    if let Some(addr) = args.common.ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
-    }
-    if let Some(addr) = args.common.ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
-    }
-    let endpoint = builder.bind().await?;
+    let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
     wait_online(&endpoint).await;
     let node_addr = endpoint.node_addr().await?;
     let mut short = node_addr.clone();
@@ -1235,13 +1249,12 @@ dumbpipe connect-udp --addr 0.0.0.0:0 {short}"
         let remote_node_id = &conn.remote_node_id()?;
         tracing::info!("got connection from {}", remote_node_id);
 
+        let (s, mut r) = conn.accept_bi().await.context("accept_bi")?;
         if handshake {
             // read the handshake and verify it
             let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
-            let (_s, mut r) = conn.accept_bi().await.context("accept_bi")?;
             r.read_exact(&mut buf).await?;
             ensure!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
-            // we don't need the stream anymore; drop it and let the unreliable datagram API do the work
         }
 
         let udp = tokio::net::UdpSocket::bind("0.0.0.0:0")
@@ -1250,7 +1263,7 @@ dumbpipe connect-udp --addr 0.0.0.0:0 {short}"
         udp.connect(&*addrs).await.context("udp connect")?;
         tracing::info!("opened UDP {} <-> {}", remote_node_id, addrs[0]);
 
-        forward_udp_bidi(conn, udp).await
+        forward_udp_stream(s, r, udp).await
     }
 
     loop {
@@ -1266,7 +1279,7 @@ dumbpipe connect-udp --addr 0.0.0.0:0 {short}"
         let handshake = !args.common.is_custom_alpn();
         tokio::spawn(async move {
             if let Err(cause) = handle_magic_udp(incoming, addrs, handshake).await {
-                tracing::warn!("error handling connection: {}", cause);
+                tracing::warn!("error handling connection: {cause:#}");
             }
         });
     }
@@ -1280,19 +1293,17 @@ async fn connect_udp(args: ConnectUdpArgs) -> Result<()> {
         .to_socket_addrs()
         .context(format!("invalid host string {}", args.addr))?;
     let secret_key = get_or_create_secret()?;
-    let mut builder = Endpoint::builder().secret_key(secret_key).alpns(vec![]);
-    if let Some(addr) = args.common.ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
-    }
-    if let Some(addr) = args.common.ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
-    }
-    let endpoint = builder.bind().await.context("unable to bind magicsock")?;
-
+    let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
     let udp = tokio::net::UdpSocket::bind(addrs.as_slice())
         .await
         .context("bind udp socket")?;
-    tracing::info!("udp listening on {:?}", addrs);
+    // This is the fix: get the actual local address and print it for the user.
+    // This is important if the user specifies port 0 to get a random free port.
+    let local_addr = udp
+        .local_addr()
+        .context("failed to get local udp address")?;
+    eprintln!("UDP listening on {}", local_addr);
+    tracing::info!("UDP listening on {}", local_addr);
 
     let addr = args.ticket.node_addr();
     let remote_node_id = addr.node_id;
@@ -1301,16 +1312,14 @@ async fn connect_udp(args: ConnectUdpArgs) -> Result<()> {
         .await
         .context(format!("connect to {remote_node_id}"))?;
 
+    let (mut s, r) = connection.open_bi().await.context("open_bi")?;
     if !args.common.is_custom_alpn() {
-        // send the handshake using a short-lived bidi stream
-        let (mut s, r) = connection.open_bi().await.context("open_bi")?;
+        // The handshake is followed by framed UDP packets on this stream.
         s.write_all(&dumbpipe::HANDSHAKE).await?;
-        // we don't need the stream anymore
-        drop((s, r));
     }
 
     tracing::info!("starting UDP <-> QUIC forwarding to {}", remote_node_id);
-    forward_udp_bidi(connection, udp).await
+    forward_udp_stream(s, r, udp).await
 }
 
 #[cfg(test)]
