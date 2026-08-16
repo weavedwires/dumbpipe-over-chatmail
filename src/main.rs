@@ -3,6 +3,7 @@ use std::{
     io,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     str::FromStr,
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -26,6 +27,65 @@ use {
 };
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default relay servers used when `--relay` is not specified.
+///
+/// These are self-hosted chatmail/RU relays (mostly Delta Chat chatmail
+/// servers) that speak the plain WebSocket relay protocol, instead of the
+/// built-in n0 relay preset that ships with iroh, which the iroh 0.35 relay
+/// client can no longer talk to (HTTP 400).
+const DEFAULT_RELAYS: &[&str] = &[
+    "https://nine.testrun.org",
+    "https://mehl.cloud",
+    "https://mailchat.pl",
+    "https://chatmail.woodpeckersnest.space",
+    "https://chatmail.culturanerd.it",
+    "https://chat.adminforge.de",
+    "https://chika.aangat.lahat.computer",
+    "https://tarpit.fun",
+    "https://d.gaufr.es",
+    "https://chtml.ca",
+    "https://e2ee.wang",
+    "https://chat.privittytech.com",
+    "https://e2ee.im",
+    "https://chatmail.email",
+    "https://chat.in-the.eu",
+    "https://chat.nuvon.app",
+    "https://nibblehole.com",
+    "https://chat.zashm.org",
+    "https://chat.sus.fr",
+    "https://delta.thelab.uno",
+    "https://chat.vim.wtf",
+    "https://uninterest.ing",
+    "https://sweetfern.net",
+    "https://delta.disobey.net",
+    "https://chat.gluek.info",
+    "https://chatmail.uk",
+    "https://arcanechat.me",
+    "https://dnd.wb.ru",
+    "https://talklink.fun",
+    "https://cm.dc09.xyz",
+    "https://deltachat.kz",
+    "https://cm1.wwire.su",
+    "https://msk.ru.deltachat.fans",
+    "https://krsk.ru.deltachat.fans",
+    "https://se.deltachat.fans",
+    "https://chat.ourpeering.cc",
+    "https://chat.tatars.cc",
+    "https://chat.bashkort.cc",
+    "https://chat.chudppl.org",
+    "https://chat.pdvkn.ru",
+    "https://cm4.project26.cc",
+];
+
+/// The relay map built from [`DEFAULT_RELAYS`].
+static DEFAULT_RELAY_MAP: LazyLock<RelayMap> = LazyLock::new(|| {
+    RelayMap::from_iter(
+        DEFAULT_RELAYS
+            .iter()
+            .map(|url| RelayUrl::from_str(url).expect("invalid default relay url")),
+    )
+});
 
 /// Create a dumb pipe between two machines, using an iroh endpoint.
 ///
@@ -320,6 +380,8 @@ async fn create_endpoint(
     let mut builder = Endpoint::builder().secret_key(secret_key).alpns(alpns);
     if let Some(relay) = &common.relay {
         builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay.clone())));
+    } else {
+        builder = builder.relay_mode(RelayMode::Custom(DEFAULT_RELAY_MAP.clone()));
     }
     if let Some(addr) = common.ipv4_addr {
         builder = builder.bind_addr_v4(addr);

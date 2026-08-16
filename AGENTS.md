@@ -8,6 +8,7 @@ Single-crate Rust CLI (`dumbpipe`) that pipes data over iroh (QUIC + hole punchi
 - `src/lib.rs` exposes only the wire protocol: `ALPN = b"DUMBPIPEV0"`, `HANDSHAKE = b"hello"`, and re-exports `iroh_base::ticket::NodeTicket`. Bump these carefully — they affect all iroh integrations.
 - Handshake protocol: the connect side always writes the 5-byte `HANDSHAKE` first; the listen side reads and validates it. `--custom-alpn` disables the handshake entirely on both sides (see `is_custom_alpn()` in main.rs). ALPN parsing: `utf8:<text>` or hex (main.rs `parse_alpn`).
 - iroh is pinned to `0.35` (TLS provider is `ring`, not aws-lc). This repo tracks iroh releases closely — expect API breakages on iroh upgrades.
+- The default relay map (when `--relay` is absent) is the `DEFAULT_RELAYS` list of self-hosted chatmail/RU relays in `main.rs`, built into a `RelayMode::Custom` map; iroh's built-in n0 relay preset is not used (the 0.35 client gets HTTP 400 from n0 relays). `--relay <url>` overrides with a single relay.
 
 ## Commands (match CI)
 
