@@ -1,10 +1,12 @@
 #![cfg_attr(target_os = "windows", allow(unused_imports, dead_code))]
 use std::{
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     net::{TcpListener, TcpStream},
+    process::{Child, ChildStderr, Command, Stdio},
     str::FromStr,
-    sync::{Arc, Barrier},
-    time::Duration,
+    sync::{mpsc, Arc, Barrier},
+    thread,
+    time::{Duration, Instant},
 };
 
 use dumbpipe::EndpointTicket;
@@ -46,6 +48,186 @@ fn wait2() -> Arc<Barrier> {
 /// generate a random, non privileged port
 fn random_port() -> u16 {
     rand::rng().random_range(10000u16..60000)
+}
+
+/// Relays to exercise with `--no-direct`. All hostnames use the trailing-dot
+/// FQDN form.
+const RELAYS: &[&str] = &[
+    "https://dnd.wb.ru.", // RU
+];
+
+/// How long the listen side has to print a ticket.
+const RELAY_TICKET_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a connect attempt through a relay may take.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long the listen side may take to shut down after the connection closes.
+const RELAY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reads the stderr of a `listen` process, sending the printed ticket (if any)
+/// on the channel, then keeps draining the stderr so the pipe never fills up.
+fn drain_listen_ticket(stderr: ChildStderr) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let reader = io::BufReader::new(stderr);
+        let mut sent = false;
+        for line in reader.lines().map_while(Result::ok) {
+            if !sent && line.starts_with("dumbpipe connect ") {
+                if let Some(ticket) = line.split_whitespace().last() {
+                    let _ = tx.send(ticket.to_owned());
+                    sent = true;
+                }
+            }
+        }
+    });
+    (rx, handle)
+}
+
+/// Drains the stderr of a process into an unbounded channel for diagnostics.
+fn capture_stderr(stderr: ChildStderr) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let reader = io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    (rx, handle)
+}
+
+/// Joins all currently buffered stderr lines into a single string.
+fn drain_all(rx: &mpsc::Receiver<String>) -> String {
+    rx.try_iter().collect::<Vec<_>>().join("\n")
+}
+
+/// Polls `try_wait` until the child exits or `timeout` elapses.
+fn wait_for_child(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return true,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Runs a full `listen`/`connect` roundtrip through a single relay with direct
+/// connections disabled. Panics (naming the relay) on any failure.
+fn relay_no_direct_roundtrip(relay: &str) {
+    const LISTEN_TO_CONNECT: &[u8] = b"hello from listen";
+    const CONNECT_TO_LISTEN: &[u8] = b"hello from connect";
+
+    // Start a listen process bound to only the given relay, no direct connections.
+    let mut listen = Command::new(dumbpipe_bin())
+        .args(["listen", "--no-direct", "--relay", relay])
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect(&format!("relay {relay}: failed to spawn listen"));
+
+    // Write the listen->connect payload, but keep stdin open until the
+    // connection is set up so we don't race against an early EOF.
+    let mut listen_stdin = listen.stdin.take().unwrap();
+    listen_stdin
+        .write_all(LISTEN_TO_CONNECT)
+        .expect(&format!("relay {relay}: failed to write listen stdin"));
+
+    // Extract the ticket from stderr, with a timeout.
+    let (ticket_rx, listen_err_thread) = drain_listen_ticket(listen.stderr.take().unwrap());
+    let ticket = match ticket_rx.recv_timeout(RELAY_TICKET_TIMEOUT) {
+        Ok(ticket) => ticket,
+        Err(_) => {
+            let _ = listen.kill();
+            let _ = listen.wait();
+            panic!("relay {relay}: listen printed no ticket within {RELAY_TICKET_TIMEOUT:?}");
+        }
+    };
+
+    // Start a connect process that dials only via the same relay.
+    let mut connect = Command::new(dumbpipe_bin())
+        .args(["connect", "--no-direct", "--relay", relay, ticket.as_str()])
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect(&format!("relay {relay}: failed to spawn connect"));
+    let (connect_err_rx, connect_err_thread) = capture_stderr(connect.stderr.take().unwrap());
+    connect
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(CONNECT_TO_LISTEN)
+        .expect(&format!("relay {relay}: failed to write connect stdin"));
+
+    // Wait for connect to finish; it should exit on its own once both sides EOF'd.
+    if !wait_for_child(&mut connect, RELAY_CONNECT_TIMEOUT) {
+        let _ = connect.kill();
+        let _ = connect.wait();
+        panic!(
+            "relay {relay}: connect timed out after {RELAY_CONNECT_TIMEOUT:?}\n{}",
+            drain_all(&connect_err_rx)
+        );
+    }
+    let connect_status = connect.wait().unwrap();
+
+    let mut connect_out = Vec::new();
+    connect
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut connect_out)
+        .unwrap();
+
+    assert!(
+        connect_status.success(),
+        "relay {relay}: connect failed with {connect_status}\n{}",
+        drain_all(&connect_err_rx)
+    );
+    assert!(
+        connect_out.starts_with(LISTEN_TO_CONNECT),
+        "relay {relay}: connect received wrong data: {:?}",
+        String::from_utf8_lossy(&connect_out)
+    );
+
+    // Once the connection is closed the listen side should exit on its own.
+    if !wait_for_child(&mut listen, RELAY_CLEANUP_TIMEOUT) {
+        let _ = listen.kill();
+        let _ = listen.wait();
+    }
+    drop(listen_stdin);
+    let mut listen_out = Vec::new();
+    listen
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut listen_out)
+        .unwrap();
+
+    assert!(
+        listen_out.starts_with(CONNECT_TO_LISTEN),
+        "relay {relay}: listen received wrong data: {:?}",
+        String::from_utf8_lossy(&listen_out)
+    );
+
+    let _ = listen_err_thread.join();
+    let _ = connect_err_thread.join();
+}
+
+/// Connects two endpoints through each configured relay with direct
+/// connections disabled; fails (print the relay) if any single relay fails.
+#[test]
+#[ignore = "flaky"]
+fn no_direct_all_relays_roundtrip() {
+    for relay in RELAYS {
+        relay_no_direct_roundtrip(relay);
+    }
 }
 
 /// Tests the basic functionality of the connect and listen pair

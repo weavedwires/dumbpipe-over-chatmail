@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use dumbpipe::EndpointTicket;
 use iroh::{
     endpoint::{presets, Accepting},
-    Endpoint, EndpointAddr, SecretKey,
+    Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey,
 };
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
 use tokio::{
@@ -135,6 +135,18 @@ pub struct CommonArgs {
     /// Otherwise, it will be parsed as a hex string.
     #[clap(long)]
     pub custom_alpn: Option<String>,
+
+    /// Use only the specified relay, replacing the default n0 relays
+    /// (e.g. https://use1-1.relay.n0.iroh.link).
+    ///
+    /// Direct / hole-punching connection attempts are still made.
+    #[clap(short = 'r', long)]
+    pub relay: Option<RelayUrl>,
+
+    /// Only use the relay transport: do not listen for or initiate direct
+    /// (hole punching) connections. All traffic goes through a relay.
+    #[clap(long)]
+    pub no_direct: bool,
 
     /// The verbosity level. Repeat to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
@@ -308,6 +320,16 @@ async fn create_endpoint(
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(alpns);
+    if common.no_direct {
+        // Remove the IP transports so the endpoint neither listens for nor
+        // initiates direct (hole punching) connections. Also disable the
+        // address lookup, which may otherwise publish or resolve direct
+        // addresses outside of tickets.
+        builder = builder.clear_ip_transports().clear_address_lookup();
+    }
+    if let Some(relay) = &common.relay {
+        builder = builder.relay_mode(RelayMode::custom([relay.clone()]));
+    }
     if let Some(addr) = common.ipv4_addr {
         builder = builder.bind_addr(addr)?;
     }
@@ -425,7 +447,7 @@ async fn listen_stdio(args: ListenArgs) -> Result<()> {
 async fn connect_stdio(args: ConnectArgs) -> Result<()> {
     let secret_key = get_or_create_secret()?;
     let endpoint = create_endpoint(secret_key, &args.common, vec![]).await?;
-    let addr = args.ticket.endpoint_addr();
+    let addr = dial_addr(&args.ticket, args.common.no_direct);
     let remote_endpoint_id = addr.id;
     // connect to the remote, try only once
     let connection = endpoint
@@ -514,7 +536,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         forward_bidi(tcp_recv, tcp_send, endpoint_recv, endpoint_send).await?;
         Ok::<_, AnyError>(())
     }
-    let addr = args.ticket.endpoint_addr();
+    let addr = dial_addr(&args.ticket, args.common.no_direct);
     loop {
         // also wait for ctrl-c here so we can use it before accepting a connection
         let next = tokio::select! {
@@ -640,6 +662,20 @@ fn create_short_ticket(addr: &EndpointAddr) -> EndpointTicket {
         short = short.with_relay_url(relay_url.clone());
     }
     short.into()
+}
+
+/// The address to dial from a ticket, dropping direct addresses when the
+/// `--no-direct` flag is set so only relay dialing happens.
+fn dial_addr(ticket: &EndpointTicket, no_direct: bool) -> EndpointAddr {
+    let addr = ticket.endpoint_addr();
+    if !no_direct {
+        return addr.clone();
+    }
+    let mut addr = EndpointAddr::new(addr.id);
+    for relay_url in ticket.endpoint_addr().relay_urls() {
+        addr = addr.with_relay_url(relay_url.clone());
+    }
+    addr
 }
 
 #[cfg(unix)]
@@ -783,7 +819,7 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
         }
     }
 
-    let addr = args.ticket.endpoint_addr();
+    let addr = dial_addr(&args.ticket, args.common.no_direct);
     tracing::info!("connecting to remote endpoint: {:?}", addr);
     let connection = endpoint
         .connect(addr.clone(), &args.common.alpn()?)
