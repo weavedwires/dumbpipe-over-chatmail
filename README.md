@@ -1,175 +1,176 @@
 # Dumb pipe
 
-This is an example to use [iroh](https://crates.io/crates/iroh) to create a dumb pipe to connect two machines with a QUIC connection.
+Это пример использования [iroh](https://crates.io/crates/iroh) для создания "тупой трубы", соединяющей две машины по QUIC.
 
-Iroh will take care of hole punching and NAT traversal whenever possible, and fall back to a
-relay if hole punching does not succeed.
+Iroh занимается hole punching и прохождением NAT там, где это возможно, а если hole punching не срабатывает — выполняет резервное соединение через релейный сервер.
 
-It is also useful as a standalone tool for quick copy jobs.
+Также полезна как отдельный инструмент для быстрого копирования данных.
 
-This is inspired by the unix tool [netcat](https://en.wikipedia.org/wiki/Netcat). While netcat
-works with IP addresses, dumbpipe works with 256 bit endpoint ids and therefore is somewhat location transparent. In addition, connections are encrypted using TLS.
+Вдохновлено unix-утилитой [netcat](https://en.wikipedia.org/wiki/Netcat). Если netcat работает с IP-адресами, то dumbpipe — с 256-битными идентификаторами конечных точек, поэтому она в некоторой степени прозрачна к расположению. Кроме того, соединения шифруются с помощью TLS.
 
-# Installation
+# Отличия от оригинала
 
-With [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html):
+Эта сборка привязана к [iroh](https://crates.io/crates/iroh) версии 0.35 и работает поверх встроенного в [chatmail](https://chatmail.io)-серверы iroh-релея как посредника: список релеев по умолчанию состоит из нескольких, работающих по всему миру, chatmail релеев. С официальными iroh-релеями, которые обслуживает n0, она **не** работает — они давно не поддерживают iroh версии 0.35.
+
+Чтобы указать конкретный релей можно использовать ```-r nine.testrun.org```
+
+Чтобы запретить подключаться в обход релеев (напрямую), например в целях конфиденциальности можно указать флаг ```--no-direct```
+
+# Установка
+
+Через [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html):
 
 ```
 cargo install dumbpipe
 ```
 
-If you've installed [Homebrew](https://brew.sh), you can install it using the following command:
+Если у вас установлен [Homebrew](https://brew.sh), можно установить так:
 
 ```
 brew install dumbpipe
 ```
 
-# Examples
+# Примеры
 
-## Use dumbpipe to stream video using [ffmpeg / ffplay](https://ffmpeg.org/):
+## Потоковое видео через dumbpipe с помощью [ffmpeg / ffplay](https://ffmpeg.org/):
 
-This is using standard input and output.
+Используются стандартный ввод и вывод.
 
-### Sender side
+### Сторона отправителя
 
-On Mac OS:
+На Mac OS:
 ```
 ffmpeg -f avfoundation -r 30 -i "0" -pix_fmt yuv420p -f mpegts - | dumbpipe listen
 ```
-On Linux:
+На Linux:
 ```
 ffmpeg -f v4l2 -i /dev/video0 -r 30 -preset ultrafast -vcodec libx264 -tune zerolatency -f mpegts - | dumbpipe listen
 ```
-outputs ticket
+выводит тикет
 
-### Receiver side
+### Сторона получателя
 ```
 dumbpipe connect endpointealvvv4nwa522qhznqrblv6jxcrgnvpapvakxw5i6mwltmm6ps2r4aicamaakdu5wtjasadei2qdfuqjadakqk3t2ieq | ffplay -f mpegts -fflags nobuffer -framedrop -
 ```
 
-- Adjust the ffmpeg options according to your local platform and video capture devices.
-- Use ticket from sender side
+- Подберите параметры ffmpeg под вашу платформу и устройства видеозахвата.
+- Используйте тикет со стороны отправителя.
 
-## Share a shell for pair- or ensemble programming with [tty-share](https://github.com/elisescu/tty-share):
+## Общий доступ к shell для парного программирования с помощью [tty-share](https://github.com/elisescu/tty-share):
 
-Sharing a terminal session over the internet is useful for collaboration between programmers, but the public [tty-share](https://github.com/elisescu/tty-share) server isn't very reliable and, more importantly, [it is not end-to-end encrypted](https://tty-share.com/how-it-works/#end-to-end-encryption).
+Совместное использование терминальной сессии через интернет полезно при работе программистов в команде, но публичный [tty-share](https://github.com/elisescu/tty-share)-сервер не очень надёжен и, что важнее, [не шифруется сквозным шифрованием](https://tty-share.com/how-it-works/#end-to-end-encryption).
 
-On the server:
+На сервере:
 
 ```
 $ dumbpipe listen-tcp --host localhost:8000 &
 $ tty-share
 ```
 
-On the client(s):
+На клиенте(ах):
 
 ```
 $ dumbpipe connect-tcp --addr localhost:8000 <ticket> &
 $ tty-share http://localhost:8000/s/local/
 ```
 
-## Forward development web server
+## Проксирование веб-сервера для разработки
 
-You have a development webserver running on port 3000, and want to share it with
-a colleague in another office or on the other side of the world.
+У вас есть dev-вебсервер на порту 3000, и вы хотите поделиться им с
+коллегой из другого офиса или из другого конца света.
 
-### The web server
+### Веб-сервер
 ```
 npm run dev
 >    - Local:        http://localhost:3000
 ```
 
-### The dumbpipe listener
+### Слушатель dumbpipe
 
-*Listens* on an endpoint and forwards all incoming requests to the dev web
-server that is listening on localhost on port 3000. Any number of connections can
-flow through a single dumb pipe, but they will be separate local tcp connections.
+«Слушает» на конечной точке и перенаправляет все входящие запросы на dev-вебсервер, который слушает localhost на порту 3000. Через одну «трубу» может проходить любое количество соединений, но это будут отдельные локальные tcp-соединения.
 
 ```
 dumbpipe listen-tcp --host localhost:3000
 ```
-This command will output a ticket that can be used to connect.
+Эта команда выведет тикет, который можно использовать для подключения.
 
-### The dumbpipe connector
+### Коннектор dumbpipe
 
-*Listens* on a tcp interface and port on the local machine. In this case on port 3001.
-Forwards all incoming connections to the endpoint given in the ticket.
+«Слушает» на tcp-интерфейсе и порту на локальной машине. В данном случае — на порту 3001.
+Перенаправляет все входящие соединения на конечную точку из тикета.
 
 ```
 dumbpipe connect-tcp --addr 0.0.0.0:3001 <ticket>
 ```
 
-### Testing it
+### Проверка
 
-You can now browse the website on port 3001.
+Теперь вы можете открыть сайт на порту 3001.
 
-## Forward a Unix Socket Application (e.g., Zellij)
+## Проксирование приложения через Unix-сокет (например, Zellij)
 
-You can forward applications that communicate over Unix sockets, like the terminal multiplexer [Zellij](https://zellij.dev/).
+Можно проксировать приложения, работающие через Unix-сокеты, например терминальный мультиплексор [Zellij](https://zellij.dev/).
 
-Note: Zellij keeps its session sockets under `$ZELLIJ_SOCKET_DIR/<VERSION>/session-name`
+Примечание: Zellij хранит свои сессионные сокеты в `$ZELLIJ_SOCKET_DIR/<VERSION>/session-name`
 
 ![image](https://github.com/user-attachments/assets/b8fbb988-57db-40cd-95e2-208e01fbaad6)
 
-1. On the remote host (with Zellij running):
+1. На удалённом хосте (с запущенным Zellij):
 
 ```bash
 zellij --version
 # zellij 0.42.2
-# Forward the remote Zellij socket
-# Socket path follows pattern: /tmp/zellij-0/<VERSION>/<session-name>
+# Прокидываем удалённый сокет Zellij
+# Путь к сокету соответствует шаблону: /tmp/zellij-0/<VERSION>/<session-name>
 dumbpipe listen-unix --socket-path /tmp/zellij-0/0.42.2/remote-task-1234
 ```
 
-This will give you a `<ticket>`.
+Это даст вам `<ticket>`.
 
-2. On your local machine:
+2. На вашей локальной машине:
 
 ```bash
 zellij --version
 # zellij 0.42.1
 
-# Create the local socket directory structure
+# Создаём структуру каталогов для локального сокета
 mkdir -p /tmp/zj-remote/0.42.1
 
-# Create a local socket connected to the remote one
+# Создаём локальный сокет, подключённый к удалённому
 dumbpipe connect-unix --socket-path /tmp/zj-remote/0.42.1/remote-task-1234 <ticket>
 ```
 
-3. Attach your local Zellij client:
+3. Подключаемся локальным клиентом Zellij:
 
 ```bash
-# In a new terminal window/tab, set the socket directory and attach
+# В новом окне/вкладке терминала укажите каталог сокетов и подключитесь
 ZELLIJ_SOCKET_DIR=/tmp/zj-remote zellij attach remote-task-1234
 ```
 
-# Advanced features
+# Расширенные возможности
 
-## Combining Listeners
+## Комбинирование слушателей
 
-You can mix and match listeners. For example, forward from a remote Unix socket to a local TCP port:
+Слушателей можно комбинировать. Например, перенаправить данные из удалённого Unix-сокета на локальный TCP-порт:
 
 ```bash
-# Machine A: Listen on a Unix socket
+# Машина A: слушает на Unix-сокете
 dumbpipe listen-unix --socket-path /var/run/my-app.sock
 
-# Machine B: Connect to it via a local TCP port
+# Машина B: подключается через локальный TCP-порт
 dumbpipe connect-tcp --addr 127.0.0.1:8080 <ticket>
 ```
 
-## Custom ALPNs
+## Свои ALPN
 
-Dumbpipe has an expert feature to specify a custom [ALPN](https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation) string. You can use it to interact with
-existing iroh services.
+В dumbpipe есть экспертная возможность указать свой [ALPN](https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation) — строку. Её можно использовать для взаимодействия с существующими iroh-сервисами.
 
-E.g. here is how to interact with the iroh-blobs
-protocol:
+Например, вот как взаимодействовать с протоколом iroh-blobs:
 
 ```
-echo request1.bin | dumbpipe connect <ticket> --custom-alpn utf8:/iroh-bytes/2 > response1.bin
+echo request1.bin | dumbpipe connect <ticket> --custom-alpn utf8:/iroh-bytes/4 > response1.bin
 ```
 
-(`/iroh-bytes/2` is the ALPN string for the iroh-blobs protocol, which used to be called iroh-bytes.)
+(`/iroh-bytes/4` — это ALPN, используемый iroh-blobs 0.35. iroh-blobs — отдельный от iroh крейт; раньше он назывался iroh-bytes и поставлялся внутри крейта iroh.)
 
-if request1.bin contained a valid request for the `/iroh-bytes/2` protocol, response1.bin will
-now contain the response.
+Если в request1.bin содержится корректный запрос для протокола `/iroh-bytes/4`, то в response1.bin теперь будет ответ.
