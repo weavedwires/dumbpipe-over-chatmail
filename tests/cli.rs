@@ -9,8 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dumbpipe::EndpointTicket;
-use rand::RngExt;
+use dumbpipe::NodeTicket;
+use rand::Rng;
 
 // binary path
 fn dumbpipe_bin() -> &'static str {
@@ -47,13 +47,17 @@ fn wait2() -> Arc<Barrier> {
 
 /// generate a random, non privileged port
 fn random_port() -> u16 {
-    rand::rng().random_range(10000u16..60000)
+    rand::thread_rng().gen_range(10000u16..60000)
 }
 
 /// Relays to exercise with `--no-direct`. All hostnames use the trailing-dot
-/// FQDN form.
+/// FQDN form. These are self-hosted RU relays that speak the plain WebSocket
+/// relay protocol (no `Sec-WebSocket-Protocol` negotiation), unlike the
+/// default n0 staging/production relays that iroh 0.35 is incompatible with.
 const RELAYS: &[&str] = &[
-    "https://dnd.wb.ru.", // RU
+    "https://dnd.wb.ru.",       // RU
+    "https://chat.gluek.info.", // RU
+    "https://cm1.wwire.su.",    // RU
 ];
 
 /// How long the listen side has to print a ticket.
@@ -129,14 +133,17 @@ fn relay_no_direct_roundtrip(relay: &str) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect(&format!("relay {relay}: failed to spawn listen"));
+        .unwrap_or_else(|_| panic!("relay {relay}: failed to spawn listen"));
 
-    // Write the listen->connect payload, but keep stdin open until the
-    // connection is set up so we don't race against an early EOF.
+    // Write the listen->connect payload and close the pipe so the listen side
+    // reaches EOF on its send side once the stream is set up. The write is done
+    // before the connect process even spawns, so there is no EOF race: the bytes
+    // stay buffered in the pipe until the listener forwards them.
     let mut listen_stdin = listen.stdin.take().unwrap();
     listen_stdin
         .write_all(LISTEN_TO_CONNECT)
-        .expect(&format!("relay {relay}: failed to write listen stdin"));
+        .unwrap_or_else(|_| panic!("relay {relay}: failed to write listen stdin"));
+    drop(listen_stdin);
 
     // Extract the ticket from stderr, with a timeout.
     let (ticket_rx, listen_err_thread) = drain_listen_ticket(listen.stderr.take().unwrap());
@@ -157,14 +164,14 @@ fn relay_no_direct_roundtrip(relay: &str) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect(&format!("relay {relay}: failed to spawn connect"));
+        .unwrap_or_else(|_| panic!("relay {relay}: failed to spawn connect"));
     let (connect_err_rx, connect_err_thread) = capture_stderr(connect.stderr.take().unwrap());
     connect
         .stdin
         .take()
         .unwrap()
         .write_all(CONNECT_TO_LISTEN)
-        .expect(&format!("relay {relay}: failed to write connect stdin"));
+        .unwrap_or_else(|_| panic!("relay {relay}: failed to write connect stdin"));
 
     // Wait for connect to finish; it should exit on its own once both sides EOF'd.
     if !wait_for_child(&mut connect, RELAY_CONNECT_TIMEOUT) {
@@ -201,7 +208,6 @@ fn relay_no_direct_roundtrip(relay: &str) {
         let _ = listen.kill();
         let _ = listen.wait();
     }
-    drop(listen_stdin);
     let mut listen_out = Vec::new();
     listen
         .stdout
@@ -240,7 +246,7 @@ fn connect_listen_happy() {
     // the bytes provided by the listen command
     let listen_to_connect = b"hello from listen";
     let connect_to_listen = b"hello from connect";
-    let mut listen = duct::cmd(dumbpipe_bin(), ["listen"])
+    let mut listen = duct::cmd(dumbpipe_bin(), ["listen", "--relay", RELAYS[0]])
         .env_remove("RUST_LOG") // disable tracing
         .stdin_bytes(listen_to_connect)
         .stderr_to_stdout() //
@@ -250,15 +256,18 @@ fn connect_listen_happy() {
     let header = read_ascii_lines(3, &mut listen).unwrap();
     let header = String::from_utf8(header).unwrap();
     let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = NodeTicket::from_str(ticket).unwrap();
 
-    let connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
-        .env_remove("RUST_LOG") // disable tracing
-        .stdin_bytes(connect_to_listen)
-        .stderr_null()
-        .stdout_capture()
-        .run()
-        .unwrap();
+    let connect = duct::cmd(
+        dumbpipe_bin(),
+        ["connect", "--relay", RELAYS[0], &ticket.to_string()],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stdin_bytes(connect_to_listen)
+    .stderr_null()
+    .stdout_capture()
+    .run()
+    .unwrap();
 
     assert!(connect.status.success());
     assert!(connect.stdout.starts_with(listen_to_connect));
@@ -280,7 +289,13 @@ fn connect_listen_custom_alpn_happy() {
     let connect_to_listen = b"hello from connect";
     let mut listen = duct::cmd(
         dumbpipe_bin(),
-        ["listen", "--custom-alpn", "utf8:mysuperalpn/0.1.0"],
+        [
+            "listen",
+            "--relay",
+            RELAYS[0],
+            "--custom-alpn",
+            "utf8:mysuperalpn/0.1.0",
+        ],
     )
     .env_remove("RUST_LOG") // disable tracing
     .stdin_bytes(listen_to_connect)
@@ -291,12 +306,14 @@ fn connect_listen_custom_alpn_happy() {
     let header = read_ascii_lines(3, &mut listen).unwrap();
     let header = String::from_utf8(header).unwrap();
     let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = NodeTicket::from_str(ticket).unwrap();
 
     let connect = duct::cmd(
         dumbpipe_bin(),
         [
             "connect",
+            "--relay",
+            RELAYS[0],
             &ticket.to_string(),
             "--custom-alpn",
             "utf8:mysuperalpn/0.1.0",
@@ -325,7 +342,7 @@ fn connect_listen_ctrlc_connect() {
         unistd::Pid,
     };
     // the bytes provided by the listen command
-    let mut listen = duct::cmd(dumbpipe_bin(), ["listen"])
+    let mut listen = duct::cmd(dumbpipe_bin(), ["listen", "--relay", RELAYS[0]])
         .env_remove("RUST_LOG") // disable tracing
         .stdin_bytes(b"hello from listen\n")
         .stderr_to_stdout() //
@@ -335,14 +352,17 @@ fn connect_listen_ctrlc_connect() {
     let header = read_ascii_lines(3, &mut listen).unwrap();
     let header = String::from_utf8(header).unwrap();
     let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = NodeTicket::from_str(ticket).unwrap();
 
-    let mut connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
-        .env_remove("RUST_LOG") // disable tracing
-        .stderr_null()
-        .stdout_capture()
-        .reader()
-        .unwrap();
+    let mut connect = duct::cmd(
+        dumbpipe_bin(),
+        ["connect", "--relay", RELAYS[0], &ticket.to_string()],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_null()
+    .stdout_capture()
+    .reader()
+    .unwrap();
     // wait until we get a line from the listen process
     read_ascii_lines(1, &mut connect).unwrap();
     for pid in connect.pids() {
@@ -366,7 +386,7 @@ fn connect_listen_ctrlc_listen() {
         unistd::Pid,
     };
     // the bytes provided by the listen command
-    let mut listen = duct::cmd(dumbpipe_bin(), ["listen"])
+    let mut listen = duct::cmd(dumbpipe_bin(), ["listen", "--relay", RELAYS[1]])
         .env_remove("RUST_LOG") // disable tracing
         .stderr_to_stdout()
         .reader()
@@ -375,14 +395,17 @@ fn connect_listen_ctrlc_listen() {
     let header = read_ascii_lines(3, &mut listen).unwrap();
     let header = String::from_utf8(header).unwrap();
     let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = NodeTicket::from_str(ticket).unwrap();
 
-    let mut connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
-        .env_remove("RUST_LOG") // disable tracing
-        .stderr_null()
-        .stdout_capture()
-        .reader()
-        .unwrap();
+    let mut connect = duct::cmd(
+        dumbpipe_bin(),
+        ["connect", "--relay", RELAYS[1], &ticket.to_string()],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_null()
+    .stdout_capture()
+    .reader()
+    .unwrap();
     std::thread::sleep(Duration::from_secs(1));
     for pid in listen.pids() {
         signal::kill(Pid::from_raw(pid as i32), Signal::SIGINT).unwrap();
@@ -417,23 +440,29 @@ fn listen_tcp_happy() {
     // wait for the tcp listener to start
     b2.wait();
     // start a dumbpipe listen-tcp process
-    let mut listen_tcp = duct::cmd(dumbpipe_bin(), ["listen-tcp", "--host", &host_port])
-        .env_remove("RUST_LOG") // disable tracing
-        .stderr_to_stdout() //
-        .reader()
-        .unwrap();
+    let mut listen_tcp = duct::cmd(
+        dumbpipe_bin(),
+        ["listen-tcp", "--relay", RELAYS[1], "--host", &host_port],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_to_stdout() //
+    .reader()
+    .unwrap();
     let header = read_ascii_lines(4, &mut listen_tcp).unwrap();
     let header = String::from_utf8(header).unwrap();
     let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = NodeTicket::from_str(ticket).unwrap();
     // poke the listen-tcp process with a connect command
-    let connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
-        .env_remove("RUST_LOG") // disable tracing
-        .stderr_null()
-        .stdout_capture()
-        .stdin_bytes(b"hello from connect")
-        .run()
-        .unwrap();
+    let connect = duct::cmd(
+        dumbpipe_bin(),
+        ["connect", "--relay", RELAYS[1], &ticket.to_string()],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_null()
+    .stdout_capture()
+    .stdin_bytes(b"hello from connect")
+    .run()
+    .unwrap();
     assert!(connect.status.success());
     assert!(connect.stdout.starts_with(b"hello from tcp"));
 }
@@ -443,7 +472,7 @@ fn connect_tcp_happy() {
     let port = random_port();
     let host_port = format!("localhost:{port}");
     // start a dumbpipe listen process just so the connect-tcp command has something to connect to
-    let mut listen = duct::cmd(dumbpipe_bin(), ["listen"])
+    let mut listen = duct::cmd(dumbpipe_bin(), ["listen", "--relay", RELAYS[2]])
         .env_remove("RUST_LOG") // disable tracing
         .stdin_bytes(b"hello from listen\n")
         .stderr_to_stdout() //
@@ -452,13 +481,20 @@ fn connect_tcp_happy() {
     let header = read_ascii_lines(3, &mut listen).unwrap();
     let header = String::from_utf8(header).unwrap();
     let ticket = header.split_ascii_whitespace().last().unwrap();
-    let ticket = EndpointTicket::from_str(ticket).unwrap();
+    let ticket = NodeTicket::from_str(ticket).unwrap();
     let ticket = ticket.to_string();
 
     // start a dumbpipe connect-tcp process
     let _connect_tcp = duct::cmd(
         dumbpipe_bin(),
-        ["connect-tcp", "--addr", &host_port, &ticket],
+        [
+            "connect-tcp",
+            "--relay",
+            RELAYS[2],
+            "--addr",
+            &host_port,
+            &ticket,
+        ],
     )
     .env_remove("RUST_LOG") // disable tracing
     .stderr_to_stdout() //
@@ -603,6 +639,8 @@ mod unix_socket_tests {
         let mut listen_proc = std::process::Command::new(dumbpipe_bin())
             .args([
                 "listen-unix",
+                "--relay",
+                RELAYS[0],
                 "--socket-path",
                 backend_sock.to_str().unwrap(),
             ])
@@ -637,6 +675,8 @@ mod unix_socket_tests {
         let mut connect_proc = std::process::Command::new(dumbpipe_bin())
             .args([
                 "connect-unix",
+                "--relay",
+                RELAYS[0],
                 "--socket-path",
                 client_sock.to_str().unwrap(),
                 &ticket,
