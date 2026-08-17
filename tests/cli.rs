@@ -10,6 +10,7 @@ use std::{
 };
 
 use dumbpipe::NodeTicket;
+use iroh::SecretKey;
 use rand::Rng;
 
 // binary path
@@ -713,4 +714,68 @@ mod unix_socket_tests {
         listen_stderr_thread.join().ok();
         connect_stderr_thread.join().ok();
     }
+}
+
+/// `save-ticket` persists a freshly generated secret to `iroh-secret.txt` in
+/// the current directory, later commands reuse it, and `IROH_SECRET` wins over
+/// the file. No network access.
+#[test]
+fn save_ticket_and_reuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let run = |args: &[&str], env: Option<(&str, &str)>| -> (String, String) {
+        let mut cmd = Command::new(dumbpipe_bin());
+        cmd.args(args).current_dir(dir).env_remove("IROH_SECRET");
+        if let Some((key, value)) = env {
+            cmd.env(key, value);
+        }
+        let out = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8(out.stdout).unwrap().trim().to_owned(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+
+    // save-ticket writes the secret file and prints a ticket.
+    let (ticket1, stderr1) = run(&["save-ticket"], None);
+    assert!(!ticket1.is_empty());
+    assert!(stderr1.contains("using secret key"), "stderr: {stderr1}");
+
+    let secret_path = dir.join("iroh-secret.txt");
+    assert!(secret_path.is_file());
+    let saved = std::fs::read_to_string(&secret_path).unwrap();
+    SecretKey::from_str(saved.trim()).expect("saved secret parses");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&secret_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    // generate-ticket reuses the saved secret, without generating a new one.
+    let (ticket2, stderr2) = run(&["generate-ticket"], None);
+    assert_eq!(ticket1, ticket2);
+    assert!(!stderr2.contains("using secret key"), "stderr: {stderr2}");
+
+    // IROH_SECRET takes priority over the file.
+    let other = "a".repeat(64);
+    let (ticket3, _) = run(&["generate-ticket"], Some(("IROH_SECRET", other.as_str())));
+    assert_ne!(ticket1, ticket3);
 }

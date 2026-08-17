@@ -1,7 +1,8 @@
 //! Command line arguments.
 use std::{
-    io,
+    fs, io,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
+    path::PathBuf,
     str::FromStr,
     sync::LazyLock,
     time::Duration,
@@ -14,19 +15,20 @@ use iroh::{
     endpoint::{Connection, Incoming, RecvStream, SendStream},
     Endpoint, NodeAddr, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     select,
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-#[cfg(unix)]
-use {
-    std::path::PathBuf,
-    tokio::net::{UnixListener, UnixStream},
-};
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Name of the file, in the directory where the program is run, used to
+/// persist the secret key for reuse across invocations.
+const SECRET_FILE_NAME: &str = "iroh-secret.txt";
 
 /// Default relay servers used when `--relay` is not specified.
 ///
@@ -97,7 +99,9 @@ static DEFAULT_RELAY_MAP: LazyLock<RelayMap> = LazyLock::new(|| {
 /// fails, it will fall back to using a relay server.
 ///
 /// For all subcommands, you can specify a secret key using the IROH_SECRET
-/// environment variable. If you don't, a random one will be generated.
+/// environment variable. If you don't, the secret saved in `iroh-secret.txt`
+/// in the current directory is reused. If there is no such file either, a
+/// random one will be generated.
 ///
 /// You can also specify a port for the endpoint. If you don't, a random one
 /// will be chosen.
@@ -115,6 +119,12 @@ pub enum Commands {
     /// This command only really makes sense when you are providing dumbpipe with a
     /// secret key.
     GenerateTicket,
+
+    /// Generate a fresh secret key, save it to `iroh-secret.txt` in the current
+    /// directory, and print a ticket for it. Future runs without IROH_SECRET
+    /// will reuse the saved secret, so the ticket can be used to connect to a
+    /// listener running in the same directory.
+    SaveTicket,
 
     /// Listen on an endpoint and forward stdin/stdout to the first incoming
     /// bidi stream.
@@ -354,20 +364,66 @@ async fn copy_from_noq(
     }
 }
 
+/// Path to the secret file in the directory where the program is run.
+fn secret_file_path() -> Result<PathBuf> {
+    let dir = std::env::current_dir().context("could not determine current directory")?;
+    Ok(dir.join(SECRET_FILE_NAME))
+}
+
+/// Read the secret key from SECRET_FILE_NAME in the current directory, if it exists.
+fn read_secret_from_file() -> Result<Option<SecretKey>> {
+    let path = secret_file_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read secret file {}", path.display()))?;
+    let secret = SecretKey::from_str(contents.trim())
+        .with_context(|| format!("invalid secret in file {}", path.display()))?;
+    Ok(Some(secret))
+}
+
+/// Write the secret key to SECRET_FILE_NAME in the current directory,
+/// with 0600 permissions on unix.
+fn write_secret_file(secret: &SecretKey) -> Result<()> {
+    let path = secret_file_path()?;
+    fs::write(&path, format!("{}\n", secret))
+        .with_context(|| format!("failed to write secret file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to set permissions on secret file {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Manufacture a new secret key, printing it to stderr so the user can save it.
+fn new_secret() -> SecretKey {
+    let key = SecretKey::generate(rand::rngs::OsRng);
+    eprintln!(
+        "using secret key {}",
+        data_encoding::HEXLOWER.encode(&key.to_bytes())
+    );
+    key
+}
+
 /// Get the secret key or generate a new one.
 ///
-/// Print the secret key to stderr if it was generated, so the user can save it.
+/// The `IROH_SECRET` environment variable takes priority, then a secret saved
+/// in SECRET_FILE_NAME in the current directory is reused. Print the secret
+/// key to stderr if it was generated, so the user can save it.
 fn get_or_create_secret() -> Result<SecretKey> {
     match std::env::var("IROH_SECRET") {
         Ok(secret) => SecretKey::from_str(&secret).context("invalid secret"),
-        Err(_) => {
-            let key = SecretKey::generate(rand::rngs::OsRng);
-            eprintln!(
-                "using secret key {}",
-                data_encoding::HEXLOWER.encode(&key.to_bytes())
-            );
-            Ok(key)
-        }
+        Err(_) => match read_secret_from_file()? {
+            Some(secret) => Ok(secret),
+            None => Ok(new_secret()),
+        },
     }
 }
 
@@ -984,12 +1040,23 @@ async fn generate_ticket() -> Result<()> {
     Ok(())
 }
 
+async fn save_ticket() -> Result<()> {
+    let secret_key = new_secret();
+    write_secret_file(&secret_key)?;
+    let public_key = secret_key.public();
+    let addr = NodeAddr::new(public_key);
+    let ticket = NodeTicket::new(addr);
+    println!("{}", ticket);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let res = match args.command {
         Commands::GenerateTicket => generate_ticket().await,
+        Commands::SaveTicket => save_ticket().await,
         Commands::Listen(args) => listen_stdio(args).await,
         Commands::ListenTcp(args) => listen_tcp(args).await,
         Commands::Connect(args) => connect_stdio(args).await,
