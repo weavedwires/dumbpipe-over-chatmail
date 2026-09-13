@@ -51,16 +51,24 @@ dumbpipe save-ticket
 
 # Установка
 
-Через [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html):
+Скачивается и устанавливается последняя версия из [releases](https://github.com/weavedwires/dumbpipe-over-chatmail/releases).
 
-```
-cargo install dumbpipe
+**Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install-linux.sh | sh
 ```
 
-Если у вас установлен [Homebrew](https://brew.sh), можно установить так:
+**macOS:**
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install-macos.sh | sh
 ```
-brew install dumbpipe
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install.ps1 | iex
 ```
 
 # Примеры
