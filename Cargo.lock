@@ -712,6 +712,7 @@ dependencies = [
  "iroh-base",
  "nix",
  "rand 0.8.7",
+ "socket2 0.5.10",
  "tempfile",
  "tokio",
  "tokio-util",

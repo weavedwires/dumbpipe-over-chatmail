@@ -11,8 +11,10 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use dumbpipe::NodeTicket;
+#[cfg(unix)]
+use iroh::endpoint::Connection;
 use iroh::{
-    endpoint::{Connection, Incoming, RecvStream, SendStream},
+    endpoint::{Incoming, RecvStream, SendStream},
     Endpoint, NodeAddr, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
 #[cfg(unix)]
