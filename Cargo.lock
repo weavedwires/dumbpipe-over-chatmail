@@ -704,6 +704,7 @@ name = "dumbpipe"
 version = "0.39.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "data-encoding",
  "duct",
