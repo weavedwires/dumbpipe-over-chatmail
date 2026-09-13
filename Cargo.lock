@@ -711,6 +711,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "nix",
+ "precis-profiles",
  "rand 0.8.7",
  "socket2 0.5.10",
  "tempfile",
