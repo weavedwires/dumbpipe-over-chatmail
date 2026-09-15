@@ -884,11 +884,34 @@ dumbpipe connect-tcp {short}"
         let connection = accepting.await.context("error accepting connection")?;
         let remote_endpoint_id = connection.remote_node_id().context("no peer certificate")?;
         tracing::info!("got connection from {}", remote_endpoint_id);
-        let (s, mut r) = connection
-            .accept_bi()
-            .await
-            .context("error accepting stream")?;
-        tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
+        // Accept bidi streams in a loop: the connecting side may reuse a single
+        // QUIC connection and open a new stream for every forwarded TCP
+        // connection, so handle all of them rather than only the first.
+        loop {
+            let (s, r) = match connection.accept_bi().await {
+                Ok(stream) => stream,
+                Err(cause) => {
+                    tracing::debug!("connection from {} closed: {}", remote_endpoint_id, cause);
+                    break;
+                }
+            };
+            tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
+            let addrs = addrs.clone();
+            tokio::spawn(async move {
+                if let Err(cause) = handle_endpoint_stream(s, r, addrs, handshake).await {
+                    tracing::warn!("error handling stream: {}", cause);
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn handle_endpoint_stream(
+        s: SendStream,
+        mut r: RecvStream,
+        addrs: Vec<std::net::SocketAddr>,
+        handshake: bool,
+    ) -> Result<()> {
         if handshake {
             // read the handshake and verify it
             let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
@@ -995,11 +1018,34 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
         let connection = accepting.await.context("error accepting connection")?;
         let remote_endpoint_id = connection.remote_node_id().context("no peer certificate")?;
         tracing::info!("got connection from {}", remote_endpoint_id);
-        let (s, mut r) = connection
-            .accept_bi()
-            .await
-            .context("error accepting stream")?;
-        tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
+        // Accept bidi streams in a loop: the connecting side may reuse a single
+        // QUIC connection and open a new stream for every forwarded connection,
+        // so handle all of them rather than only the first.
+        loop {
+            let (s, r) = match connection.accept_bi().await {
+                Ok(stream) => stream,
+                Err(cause) => {
+                    tracing::debug!("connection from {} closed: {}", remote_endpoint_id, cause);
+                    break;
+                }
+            };
+            tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
+            let socket_path = socket_path.clone();
+            tokio::spawn(async move {
+                if let Err(cause) = handle_endpoint_stream(s, r, socket_path, handshake).await {
+                    tracing::warn!("error handling stream: {}", cause);
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn handle_endpoint_stream(
+        s: SendStream,
+        mut r: RecvStream,
+        socket_path: PathBuf,
+        handshake: bool,
+    ) -> Result<()> {
         if handshake {
             // read the handshake and verify it
             tracing::trace!("reading handshake");
@@ -1246,10 +1292,36 @@ dumbpipe connect-udp --addr 0.0.0.0:0 {short}"
         handshake: bool,
     ) -> Result<()> {
         let conn = accepting.await.context("accept connection")?;
-        let remote_node_id = &conn.remote_node_id()?;
+        let remote_node_id = conn.remote_node_id()?;
         tracing::info!("got connection from {}", remote_node_id);
 
-        let (s, mut r) = conn.accept_bi().await.context("accept_bi")?;
+        // Accept bidi streams in a loop: the connecting side may reuse a single
+        // QUIC connection and open a new stream for every forwarded connection,
+        // so handle all of them rather than only the first.
+        loop {
+            let (s, r) = match conn.accept_bi().await {
+                Ok(stream) => stream,
+                Err(cause) => {
+                    tracing::debug!("connection from {} closed: {}", remote_node_id, cause);
+                    break;
+                }
+            };
+            let addrs = addrs.clone();
+            tokio::spawn(async move {
+                if let Err(cause) = handle_magic_udp_stream(s, r, addrs, handshake).await {
+                    tracing::warn!("error handling stream: {cause:#}");
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn handle_magic_udp_stream(
+        s: SendStream,
+        mut r: RecvStream,
+        addrs: Vec<std::net::SocketAddr>,
+        handshake: bool,
+    ) -> Result<()> {
         if handshake {
             // read the handshake and verify it
             let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
@@ -1261,7 +1333,7 @@ dumbpipe connect-udp --addr 0.0.0.0:0 {short}"
             .await
             .context("bind udp socket")?;
         udp.connect(&*addrs).await.context("udp connect")?;
-        tracing::info!("opened UDP {} <-> {}", remote_node_id, addrs[0]);
+        tracing::info!("opened UDP stream <-> {}", addrs[0]);
 
         forward_udp_stream(s, r, udp).await
     }
