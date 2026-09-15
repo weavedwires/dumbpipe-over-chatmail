@@ -768,18 +768,28 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
     let endpoint = create_endpoint(secret_key, &args.common, vec![])
         .await
         .context("unable to bind endpoint")?;
-    tracing::info!("tcp listening on {:?}", addrs);
-
     // Wait for our own endpoint to be ready before trying to connect.
     wait_online(&endpoint).await;
 
-    let tcp_listener = match tokio::net::TcpListener::bind(addrs.as_slice()).await {
-        Ok(tcp_listener) => tcp_listener,
-        Err(cause) => {
-            tracing::error!("error binding tcp socket to {:?}: {}", addrs, cause);
-            return Ok(());
+    // Bind every resolved address (e.g. both ::1 and 127.0.0.1 for "localhost")
+    // instead of only the first, so the tunnel is reachable over IPv4 and IPv6.
+    let mut tcp_listeners = Vec::new();
+    for addr in addrs {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                tracing::info!("tcp listening on {}", addr);
+                tcp_listeners.push(listener);
+            }
+            Err(cause) => tracing::warn!("error binding tcp socket to {}: {}", addr, cause),
         }
-    };
+    }
+    if tcp_listeners.is_empty() {
+        tracing::error!(
+            "error binding tcp socket to {}: no address bound",
+            args.addr
+        );
+        return Ok(());
+    }
     async fn handle_tcp_accept(
         next: io::Result<(tokio::net::TcpStream, SocketAddr)>,
         addr: NodeAddr,
@@ -813,28 +823,35 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         Ok(())
     }
     let addr = dial_addr(&args.ticket, args.common.no_direct);
-    loop {
-        // also wait for ctrl-c here so we can use it before accepting a connection
-        let next = tokio::select! {
-            stream = tcp_listener.accept() => stream,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("got ctrl-c, exiting");
-                break;
-            }
-        };
+    let handshake = !args.common.is_custom_alpn();
+    let alpn = args.common.alpn()?;
+    for listener in tcp_listeners {
         let endpoint = endpoint.clone();
         let addr = addr.clone();
-        let handshake = !args.common.is_custom_alpn();
-        let alpn = args.common.alpn()?;
+        let alpn = alpn.clone();
         tokio::spawn(async move {
-            if let Err(cause) = handle_tcp_accept(next, addr, endpoint, handshake, &alpn).await {
-                // log error at warn level
-                //
-                // we should know about it, but it's not fatal
-                tracing::warn!("error handling connection: {}", cause);
+            loop {
+                let next = listener.accept().await;
+                let endpoint = endpoint.clone();
+                let addr = addr.clone();
+                let alpn = alpn.clone();
+                tokio::spawn(async move {
+                    if let Err(cause) =
+                        handle_tcp_accept(next, addr, endpoint, handshake, &alpn).await
+                    {
+                        // log error at warn level
+                        //
+                        // we should know about it, but it's not fatal
+                        tracing::warn!("error handling connection: {}", cause);
+                    }
+                });
             }
         });
     }
+
+    // wait for ctrl-c before shutting down
+    tokio::signal::ctrl_c().await?;
+    eprintln!("got ctrl-c, exiting");
     endpoint.close().await;
     Ok(())
 }
