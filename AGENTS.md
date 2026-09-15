@@ -24,12 +24,14 @@ RUSTFLAGS=-Dwarnings cargo test --locked --workspace --all-features --bins --tes
 
 ## Cross-compile / release binaries
 
-- `./build-release.sh` builds `release` binaries for desktop Linux x86_64 + Android (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`) into `dist/`. NDK is auto-detected (`--ndk` > `$ANDROID_NDK_ROOT` > `$NDK_HOME` > newest dir under `~/Android/Sdk/ndk`); `--api <n>` sets the Android API level (default 24); `--help` prints the header.
-- Gotchas the script encodes (manual cross-links hit these often):
+- Release builds happen entirely in GitHub Actions (`release.yml`), triggered on tag `v*` or `workflow_dispatch`. Every target is built in a single matrix job:
+  - Desktop: Linux `x86_64-unknown-linux-gnu`, Windows `x86_64-pc-windows-msvc`, macOS `aarch64-apple-darwin` + `x86_64-apple-darwin`.
+  - Android: `aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`, `i686-linux-android`, compiled directly against an NDK installed via `nttld/setup-ndk` (r27d, API 24).
+- The Android NDK env vars are set inline in the workflow (there is no local build script). Gotchas manual cross-links hit often:
   - Per-target env vars: the cargo linker var is UPPERCASE with underscores (`CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER`), but the cc-rs compiler/ar vars are lowercase (`CC_armv7_linux_androideabi`, `AR_armv7_linux_androideabi`). Wrong case is silently ignored — you get a host-`cc` link error or `failed to find tool "arm-linux-androideabi-clang"`.
   - The armv7 NDK clang is `armv7a-linux-androideabi${API}-clang` (note the extra `a`).
   - `ring` builds C asm for Android, so the host needs `perl` plus NDK clang; all four ABIs require their rustup targets installed.
-- GitHub Actions `release.yml` cross-compiles desktop targets on tag `v*` (musl/aarch64/apple/windows) — Android is NOT in CI, use `build-release.sh` instead.
+- Release assets are named `dumbpipe-<version>-dumbpipe-<name>.<ext>`; `install-linux.sh` / `install-macos.sh` / `install.ps1` resolve them from the `latest` release, so keep the naming in sync with those scripts.
 
 ## Gotchas
 

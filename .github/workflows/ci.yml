@@ -8,6 +8,7 @@ on:
   pull_request:
     branches:
       - main
+  merge_group:
 
 env:
   MSRV: "1.91"
@@ -22,43 +23,41 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --locked --workspace --all-targets --all-features
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: cargo check
+        run: cargo check --locked --workspace --all-features --bins
+
   test:
-    runs-on: ${{ matrix.target.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        target:
+        include:
           - os: "ubuntu-latest"
-            toolchain: "x86_64-unknown-linux-gnu"
             name: "Linux GNU"
           - os: "macOS-latest"
-            toolchain: "aarch64-apple-darwin"
             name: "macOS"
           - os: "windows-latest"
-            toolchain: "x86_64-pc-windows-msvc"
             name: "Windows MSVC"
-          - os: "windows-latest"
-            toolchain: "x86_64-pc-windows-gnu"
-            name: "Windows GNU"
-        channel:
-          - "stable"
-          - "beta"
-          - "nightly"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.channel }}
-          targets: ${{ matrix.target.toolchain }}
-      - uses: swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: cargo test
         run: cargo test --locked --workspace --all-features --bins --tests --examples
 
@@ -66,24 +65,18 @@ jobs:
   check-deps:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: cargo check
-        run: cargo check --workspace --all-features --bins
+        run: cargo check --locked --workspace --all-features --bins
 
   check_semver:
     runs-on: ubuntu-latest
-    env:
-      RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Setup Environment (PR)
         if: ${{ github.event_name == 'pull_request' }}
         shell: bash
@@ -95,9 +88,7 @@ jobs:
         run: |
           echo "HEAD_COMMIT_SHA=$(git rev-parse origin/main)" >> ${GITHUB_ENV}
       - name: Check semver
-        # uses: obi1kenobi/cargo-semver-checks-action@v2
-        uses: n0-computer/cargo-semver-checks-action@feat-baseline
+        uses: obi1kenobi/cargo-semver-checks-action@v2.9
         with:
           package: dumbpipe
           baseline-rev: ${{ env.HEAD_COMMIT_SHA }}
-          use-cache: false

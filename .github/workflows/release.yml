@@ -1,5 +1,6 @@
-# Build release binaries for the desktop platforms and for Android (the same
-# targets as ./build-release.sh) and attach them to a GitHub release.
+# Build release binaries for the desktop platforms and Android and attach them
+# to a GitHub release. Every target (desktop and Android alike) is built in a
+# single matrix job, with Android compiling directly against the NDK.
 #
 # Targets built on GitHub-hosted runners (no self-hosted runners required):
 #   - Linux x86_64          (x86_64-unknown-linux-gnu)
@@ -10,9 +11,6 @@
 #   - Android armeabi-v7a   (armv7-linux-androideabi)
 #   - Android x86_64        (x86_64-linux-android)
 #   - Android x86           (i686-linux-android)
-#
-# The Android ABIs reuse the repo's own build-release.sh, fed with an NDK from
-# the nttld/setup-ndk action.
 
 name: release
 on:
@@ -26,9 +24,10 @@ on:
         required: true
 
 env:
-  BIN_NAME: dumbpipe
   # One source of truth for the version across jobs.
-  RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.release_version }}
+  RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.release_version }}
+  # Android API level for the NDK clang wrappers.
+  ANDROID_API: 24
 
 permissions:
   contents: write
@@ -53,78 +52,112 @@ jobs:
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
+          - name: android-arm64-v8a
+            os: ubuntu-latest
+            target: aarch64-linux-android
+            android: true
+          - name: android-armeabi-v7a
+            os: ubuntu-latest
+            target: armv7-linux-androideabi
+            android: true
+          - name: android-x86_64
+            os: ubuntu-latest
+            target: x86_64-linux-android
+            android: true
+          - name: android-x86
+            os: ubuntu-latest
+            target: i686-linux-android
+            android: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - name: Build release binary
+
+      - name: Install Android NDK
+        if: matrix.android
+        uses: nttld/setup-ndk@v1.6.0
+        id: setup-ndk
+        with:
+          ndk-version: r27d
+
+      - name: Build release binary (Android)
+        if: matrix.android
         shell: bash
-        run: cargo build --verbose --release --target ${{ matrix.target }}
+        env:
+          NDK_BIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          # cc-rs wants the lowercase underscored target, cargo wants uppercase.
+          cc_key="${target//-/_}"
+          linker_key="${cc_key^^}"
+          case "$target" in
+            armv7-linux-androideabi) clang="armv7a-linux-androideabi${ANDROID_API}-clang" ;;
+            *)                       clang="${target}${ANDROID_API}-clang" ;;
+          esac
+          export "CARGO_TARGET_${linker_key}_LINKER=$NDK_BIN/$clang"
+          export "CC_${cc_key}=$NDK_BIN/$clang"
+          export "AR_${cc_key}=$NDK_BIN/llvm-ar"
+          cargo build --locked --release --target "$target"
+
+      - name: Build release binary
+        if: ${{ !matrix.android }}
+        shell: bash
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
       - name: Build archive
         shell: bash
         run: |
           exe="${{ runner.os == 'Windows' && 'dumbpipe.exe' || 'dumbpipe' }}"
-          staging="dumbpipe-${{ matrix.name }}"
-          mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/$exe" "$staging/"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            powershell -NoProfile -Command \
-              "Compress-Archive -Path '$staging/*' -DestinationPath '$staging.zip'"
-            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
+          if [ "${{ matrix.android }}" = "true" ]; then
+            cp "target/${{ matrix.target }}/release/$exe" "dumbpipe-${{ matrix.name }}"
+            echo "ASSET=dumbpipe-${{ matrix.name }}" >> "$GITHUB_ENV"
           else
-            tar czf "$staging.tar.gz" -C "$staging" .
-            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+            staging="dumbpipe-${{ matrix.name }}"
+            mkdir -p "$staging"
+            cp "target/${{ matrix.target }}/release/$exe" "$staging/"
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              powershell -NoProfile -Command \
+                "Compress-Archive -Path '$staging/*' -DestinationPath '$staging.zip'"
+              echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
+            else
+              tar czf "$staging.tar.gz" -C "$staging" .
+              echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+            fi
           fi
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
-  android:
-    name: build-android
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: "aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android"
-      - name: Install Android NDK
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27d
-      - name: Build Android binaries
-        shell: bash
-        # ring builds C asm for Android, so `perl` must be available (it is on
-        # hosted runners). build-release.sh builds all 4 Android ABIs.
-        run: ./build-release.sh --ndk "${{ steps.setup-ndk.outputs.ndk-path }}"
-      - name: Collect Android artifacts
-        shell: bash
-        run: |
-          mkdir -p android-dist
-          for f in dist/dumbpipe-android-*; do
-            mv "$f" "android-dist/${f#dist/}"
-          done
-          ls -lh android-dist/
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: android
-          path: android-dist/
-          if-no-files-found: error
-
   release:
     name: release
-    needs: [build, android]
+    needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag exists
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            git rev-parse "${{ env.RELEASE_VERSION }}" \
+              || { echo "error: tag ${{ env.RELEASE_VERSION }} does not exist" >&2; exit 1; }
+          fi
+
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
+
       - name: Version the artifacts and write checksums
         shell: bash
         run: |
@@ -136,8 +169,9 @@ jobs:
           find release-assets -type f -name 'dumbpipe-*' | sort \
             | xargs sha256sum | sed -e 's|release-assets/| |' > release-assets/checksums.txt
           cat release-assets/checksums.txt
+
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
           generate_release_notes: true
