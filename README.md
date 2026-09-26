@@ -12,51 +12,14 @@ Iroh занимается hole punching и прохождением NAT там, 
 
 Эта сборка привязана к [iroh](https://crates.io/crates/iroh) версии 0.35 и работает поверх встроенного в [chatmail](https://chatmail.io)-серверы iroh-релея как посредника: список релеев по умолчанию состоит из нескольких, работающих по всему миру, chatmail релеев. С официальными iroh-релеями, которые обслуживает n0, она **не** работает — они давно не поддерживают iroh версии 0.35.
 
-Чтобы указать конкретный релей, можно использовать:
-
-```
--r nine.testrun.org
-```
-
-Чтобы запретить подключаться в обход релеев (напрямую), например в целях конфиденциальности можно указать флаг:
-
-```
---no-direct
-```
-
-Тикет можно переиспользовать между запусками. Для этого нужно передать секретный ключ одним из способов. Приоритеты:
-IROH_SECRET (ENV) -> iroh_secret.txt -> генерация нового ключа.
-
-Чтобы задать переменную IROH_SECRET выполните команду:
-
-```
-generate-ticket
-```
-
-И запускайте: 
-
-```
-IROH_SECRET="secret-random-key" dumbpipe ...
-```
-
-Любой запуск с одинаковым значением этой переменной даст одинаковый тикет.
-
-Чтобы сгенерировать ключ и сохранить его в ```iroh-secret.txt```:
-
-```
-dumbpipe save-ticket
-```
-
-После этого в текущей директории появится файл, а любой запуск из этой директории будет давать одинаковый тикет.
-
 # Установка
 
 Скачивается и устанавливается последняя версия из [releases](https://github.com/weavedwires/dumbpipe-over-chatmail/releases).
 
-**Linux:**
+**Linux или Android (Termux):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install-linux.sh | sh
+curl -fsSL https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install-linux.sh | bash
 ```
 
 **macOS:**
@@ -70,14 +33,6 @@ curl -fsSL https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/
 ```powershell
 irm https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install.ps1 | iex
 ```
-
-**Android (Termux):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install-linux.sh | sh
-```
-
-Скрипт сам определит Termux и скачает нужную ABI-сборку (arm64-v8a, armeabi-v7a, x86_64 или x86) в `$PREFIX/bin`.
 
 # Примеры
 
