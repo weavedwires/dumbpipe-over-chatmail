@@ -71,6 +71,14 @@ curl -fsSL https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/
 irm https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install.ps1 | iex
 ```
 
+**Android (Termux):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/weavedwires/dumbpipe-over-chatmail/main/install-linux.sh | sh
+```
+
+Скрипт сам определит Termux и скачает нужную ABI-сборку (arm64-v8a, armeabi-v7a, x86_64 или x86) в `$PREFIX/bin`.
+
 # Примеры
 
 ## Потоковое видео через dumbpipe с помощью [ffmpeg / ffplay](https://ffmpeg.org/):

@@ -32,6 +32,7 @@ RUSTFLAGS=-Dwarnings cargo test --locked --workspace --all-features --bins --tes
   - The armv7 NDK clang is `armv7a-linux-androideabi${API}-clang` (note the extra `a`).
   - `ring` builds C asm for Android, so the host needs `perl` plus NDK clang; all four ABIs require their rustup targets installed.
 - Release assets are named `dumbpipe-<version>-dumbpipe-<name>.<ext>`; `install-linux.sh` / `install-macos.sh` / `install.ps1` resolve them from the `latest` release, so keep the naming in sync with those scripts.
+- Android assets are raw ELF binaries (no archive). `install-linux.sh` detects Termux (`TERMUX_VERSION` or `uname -o` = `Android`) and maps `uname -m` to the ABI asset (`aarch64`→`android-arm64-v8a`, `armv7l|armv8l`→`android-armeabi-v7a`, `x86_64`→`android-x86_64`, `i686`→`android-x86`), installing into `$PREFIX/bin` without `sudo`.
 
 ## Gotchas
 
