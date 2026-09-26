@@ -230,10 +230,17 @@ pub struct CommonArgs {
     #[clap(short = 'r', long)]
     pub relay: Option<RelayUrl>,
 
-    /// DNS server for relay hostname lookups (port 53 is used).
+    /// DNS server(s) for relay hostname lookups (port 53 is used).
     /// Useful on Android/Termux, where /etc/resolv.conf may be inaccessible.
-    #[clap(long, env = "DUMBPIPE_DNS_SERVER")]
-    pub dns_server: Option<IpAddr>,
+    ///
+    /// Repeat the flag or separate values with commas to specify several.
+    #[clap(
+        long = "dns-server",
+        env = "DUMBPIPE_DNS_SERVER",
+        value_delimiter = ',',
+        value_name = "IP"
+    )]
+    pub dns_servers: Vec<IpAddr>,
 
     /// Only use the relay transport: do not listen for or initiate direct
     /// (hole punching) connections. All traffic goes through a relay.
@@ -565,17 +572,21 @@ async fn create_endpoint(
     common: &CommonArgs,
     alpns: Vec<Vec<u8>>,
 ) -> Result<Endpoint> {
-    let dns_server = common
-        .dns_server
-        .map(|ip| SocketAddr::new(ip, 53))
-        .or_else(android_dns_server);
-    if let Some(dns_server) = dns_server {
-        tracing::debug!(%dns_server, "using DNS server");
+    let mut dns_addrs: Vec<SocketAddr> = common
+        .dns_servers
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, 53))
+        .collect();
+    if dns_addrs.is_empty() {
+        dns_addrs = android_dns_servers();
+    }
+    if !dns_addrs.is_empty() {
+        tracing::debug!(?dns_addrs, "using DNS servers");
     }
 
     let mut builder = Endpoint::builder().secret_key(secret_key).alpns(alpns);
-    if let Some(dns_server) = dns_server {
-        builder = builder.dns_resolver(DnsResolver::with_nameserver(dns_server));
+    if !dns_addrs.is_empty() {
+        builder = builder.dns_resolver(dns_resolver_from(&dns_addrs));
     }
     if let Some(relay) = &common.relay {
         builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay.clone())));
@@ -592,27 +603,51 @@ async fn create_endpoint(
     Ok(endpoint)
 }
 
+/// Build a [`DnsResolver`] configured with the given UDP nameservers.
+///
+/// `iroh` 0.35 only exposes a single-nameserver constructor, so we build a
+/// hickory resolver with several nameservers and convert it via the public
+/// `From<TokioResolver>` impl.
+fn dns_resolver_from(addrs: &[SocketAddr]) -> DnsResolver {
+    let mut config = hickory_resolver::config::ResolverConfig::new();
+    for addr in addrs {
+        config.add_name_server(hickory_resolver::config::NameServerConfig::new(
+            *addr,
+            hickory_resolver::proto::xfer::Protocol::Udp,
+        ));
+    }
+    DnsResolver::from(
+        hickory_resolver::TokioResolver::builder_with_config(
+            config,
+            hickory_resolver::name_server::TokioConnectionProvider::default(),
+        )
+        .build(),
+    )
+}
+
 /// Android does not expose its resolver through `/etc/resolv.conf` to ordinary apps.
 /// Ask the system property service for the DNS servers instead.
 #[cfg(target_os = "android")]
-fn android_dns_server() -> Option<SocketAddr> {
-    (1..=4).find_map(|index| {
-        let property = std::process::Command::new("/system/bin/getprop")
-            .arg(format!("net.dns{index}"))
-            .output()
-            .ok()?;
-        let ip = String::from_utf8(property.stdout)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        Some(SocketAddr::new(ip, 53))
-    })
+fn android_dns_servers() -> Vec<SocketAddr> {
+    (1..=4)
+        .filter_map(|index| {
+            let property = std::process::Command::new("/system/bin/getprop")
+                .arg(format!("net.dns{index}"))
+                .output()
+                .ok()?;
+            let ip = String::from_utf8(property.stdout)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            Some(SocketAddr::new(ip, 53))
+        })
+        .collect()
 }
 
 #[cfg(not(target_os = "android"))]
-fn android_dns_server() -> Option<SocketAddr> {
-    None
+fn android_dns_servers() -> Vec<SocketAddr> {
+    Vec::new()
 }
 
 fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {

@@ -709,6 +709,7 @@ dependencies = [
  "data-encoding",
  "duct",
  "hex",
+ "hickory-resolver",
  "iroh",
  "iroh-base",
  "nix",
